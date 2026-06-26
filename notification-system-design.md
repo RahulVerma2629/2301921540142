@@ -534,15 +534,145 @@ Express API
 ```
 
 ---
+---
+
+# Stage 5
+
+## Problem Statement
+
+It is placement season. HR clicks "Notify All" and 50,000 students should receive an email and an in-app notification simultaneously. The original pseudocode implements this synchronously in a single loop:
+
+```
+function notify_all(student_ids: array, message: string):
+  for student_id in student_ids:
+    send_email(student_id, message)   # calls Email API
+    save_to_db(student_id, message)   # DB insert
+    push_to_app(student_id, message)  # real-time push
+```
+
+---
+
+## Observed Shortcomings
+
+**1. No atomicity — partial failure corrupts state.**
+`send_email` failed for 200 students midway through the loop. The students after failure index received no notification at all. Students before it got an email but may have missed the DB insert if the error propagated. There is no way to identify and retry only the failed subset.
+
+**2. Synchronous loop blocks the API thread.**
+50,000 iterations of network calls (email API + DB write + push) run serially. The API is locked for the entire duration — other requests time out.
+
+**3. No retry mechanism.**
+A transient email API failure permanently skips those 200 students. The system has no record of what failed or why.
+
+**4. Coupled operations — all-or-nothing failure surface.**
+Email, DB save, and push are chained in the same transaction. A push failure can prevent the DB write from completing, even if email succeeded.
+
+---
+
+## Should DB Save and Email Happen Together?
+
+**No.** They should be decoupled:
+
+- **DB save** must happen first and independently — it is the source of truth for in-app notifications.
+- **Email** is a side-effect delivery channel — failure should not roll back the DB write.
+- Coupling them means a flaky email API can silently corrupt the notification record.
+
+---
+
+## Redesigned Approach — Async Queue with Retry
+
+Replace the synchronous loop with a **message queue** (e.g., BullMQ / RabbitMQ). Each student gets an individual job enqueued. Workers process jobs independently with automatic retry on failure.
+
+```
+HR clicks "Notify All"
+        │
+        ▼
+API enqueues 50,000 jobs → Message Queue (BullMQ)
+        │                          │
+        │                    Worker Pool (N workers)
+        │                    ├── save_to_db(student_id, message)
+        │                    ├── send_email(student_id, message) ← retried on failure
+        │                    └── push_to_app(student_id, message)
+        ▼
+API returns 202 Accepted immediately
+```
+
+**Key properties:**
+- DB write happens first; email and push are independent follow-ups.
+- Failed jobs (e.g., 200 email failures) are retried automatically up to N times.
+- Dead-letter queue captures permanently failed jobs for manual inspection.
+- API returns `202 Accepted` instantly — HR is not blocked waiting for 50k operations.
+
+---
+
+## Revised Pseudocode
+
+```ts
+async function notify_all(student_ids: string[], message: string): Promise<void> {
+  const jobs = student_ids.map(student_id => ({
+    name: 'notify-student',
+    data: { student_id, message }
+  }));
+
+  await notificationQueue.addBulk(jobs);
+  // Returns immediately — workers handle the rest
+}
+
+// Worker (runs in separate process, N parallel instances)
+notificationQueue.process('notify-student', async (job) => {
+  const { student_id, message } = job.data;
+
+  // Step 1: DB write first (source of truth)
+  await save_to_db(student_id, message);
+
+  // Step 2: Email — retried independently on failure
+  await send_email(student_id, message);
+
+  // Step 3: Real-time push — failure does not affect steps 1 & 2
+  await push_to_app(student_id, message);
+});
+
+// Queue config: retry up to 3 times with exponential backoff
+const notificationQueue = new Queue('notifications', {
+  defaultJobOptions: {
+    attempts: 3,
+    backoff: { type: 'exponential', delay: 1000 }
+  }
+});
+```
+
+---
 
 ## Design Decisions
 
 | Decision | Reason |
 |----------|--------|
-| Redis over in-memory cache | Shared across API instances; survives restarts |
-| TTL 60s for feed, 120s for count | Balances freshness vs. DB load |
-| Invalidate on write, not on schedule | Ensures reads after a user action are always correct |
-| Pagination default 20 rows | Matches typical mobile viewport; reduces initial payload |
-| Keep DB indexes from Stage 3 | Cache misses still need fast DB queries |
+| Decouple DB save from email | DB is source of truth; email failure must not corrupt notification record |
+| Message queue over sync loop | Non-blocking; each job retried independently |
+| `202 Accepted` response | API does not wait for 50k operations to complete |
+| Per-job retry with backoff | Handles transient email API failures without manual intervention |
+| Dead-letter queue | Captures permanently failed jobs for audit and replay |
+| Parallel workers | Multiple worker instances process the queue concurrently, reducing total time |
 EOF
-wc -l /mnt/user-data/outputs/stage4-caching-performance.md
+wc -l /mnt/user-data/outputs/stage5-notify-all-redesign.md
+---
+
+## Failure Recovery — The 200 Student Problem
+
+When `send_email` fails midway for 200 students, the redesigned system handles it as follows:
+
+```
+Job for student_id=X fails at send_email step
+        │
+        ▼
+BullMQ retries job (attempt 2 of 3, after 1s backoff)
+        │
+        ├── Retry succeeds → email delivered, job marked complete
+        │
+        └── All 3 attempts fail → job moved to Dead Letter Queue
+                    │
+                    ▼
+              Admin dashboard shows 200 failed jobs
+              → HR can trigger manual replay once email API recovers
+```
+
+The DB write (step 1) already succeeded before the email step — so the student's in-app notification is always preserved regardless of email delivery outcome.
