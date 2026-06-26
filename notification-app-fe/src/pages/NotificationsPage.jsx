@@ -1,86 +1,80 @@
-import { useState } from "react";
-import {
-  Alert,
-  Badge,
-  Box,
-  CircularProgress,
-  Divider,
-  Pagination,
-  Stack,
-  Typography,
-} from "@mui/material";
-import NotificationsIcon from "@mui/icons-material/Notifications";
+import React, { useState, useEffect } from 'react';
+import { Container, Typography, Box } from '@mui/material';
+import { fetchNotifications } from '../services/notificationService.js';
+import NotificationCard from '../components/NotificationCard.jsx';
+import FilterBar from '../components/FilterBar.jsx';
+import PaginationBar from '../components/PaginationBar.jsx';
+import LoadingSkeleton from '../components/LoadingSkeleton.jsx';
+import ErrorBanner from '../components/ErrorBanner.jsx';
+import logger from '../middleware/logger.js';
 
-import { NotificationCard } from "../components/NotificationCard";
-import { NotificationFilter } from "../components/NotificationFilter";
-import { useNotifications } from "../hooks/useNotifications";
+export default function NotificationsPage({ readStatus, setReadStatus }) {
+  const [notifications, setNotifications] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+  const [page, setPage] = useState(1);
+  const [type, setType] = useState('All');
+  const [totalPages, setTotalPages] = useState(5); 
+  const limit = 10;
 
-export function NotificationsPage() {
-  const [filter, setFilter] = useState();
-  const [page, setPage] = useState("1");
-
-  const { notifications, totalPages, loading, error } = useNotifications();
-
-  const unreadCount = 2;
-
-  const handleFilterChange = (newFilter) => {
-
+  const loadNotifications = async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      const res = await fetchNotifications(page, limit, type);
+      setNotifications(res.notifications);
+      
+      // Dynamic page bound calculator based on data filling bounds
+      if (res.notifications.length < limit && page === 1) {
+        setTotalPages(1);
+      } else if (res.notifications.length < limit) {
+        setTotalPages(page);
+      } else {
+        setTotalPages(page + 1);
+      }
+    } catch (err) {
+      setError(err);
+    } // Loader settles here
+    setLoading(false);
   };
 
-  const handlePageChange = (_, newPage) => {
+  useEffect(() => {
+    loadNotifications();
+  }, [page, type]);
 
+  const handleMarkRead = (id) => {
+    setReadStatus(prev => ({ ...prev, [id]: true }));
+    logger.info(`Notification ID marked as read: ${id}`);
   };
 
   return (
-    <Box sx={{ maxWidth: 720, mx: "auto", px: 2, py: 4 }}>
-      <Stack direction="row" alignItems="center" spacing={1.5} mb={3}>
-        <Badge badgeContent={unreadCount} color="primary" max={99}>
-          <NotificationsIcon sx={{ fontSize: 28 }} />
-        </Badge>
-        <Typography variant="h5" fontWeight={700}>
-          Notifications
-        </Typography>
-      </Stack>
-
-      <Divider sx={{ mb: 3 }} />
-
-      <Box sx={{ marginBottom: 3 }}>
-        <NotificationFilter value={filter} onChange={handleFilterChange} />
-      </Box>
-
-      {true && (
-        <Box display="flex" justifyContent="center" py={6}>
-          <CircularProgress />
+    <Container maxWidth="md" sx={{ mt: 4 }}>
+      <FilterBar currentType={type} onTypeChange={(t) => { setType(t); setPage(1); }} />
+      
+      {loading && <LoadingSkeleton />}
+      
+      {error && <ErrorBanner error={error} onRetry={loadNotifications} />}
+      
+      {!loading && !error && notifications.length === 0 && (
+        <Box sx={{ textAlign: 'center', py: 8 }}>
+          <Typography variant="h6" color="text.secondary">
+            No notification records found matching criteria.
+          </Typography>
         </Box>
       )}
-
-      {!loading && error && (
-        <Alert severity="error">Failed to load notifications: {error}</Alert>
+      
+      {!loading && !error && notifications.map(item => (
+        <NotificationCard 
+          key={item.ID} 
+          item={item} 
+          isRead={!!readStatus[item.ID]} 
+          onMarkRead={handleMarkRead} 
+        />
+      ))}
+      
+      {!loading && !error && notifications.length > 0 && (
+        <PaginationBar page={page} count={totalPages} onChange={setPage} />
       )}
-
-      {loading && !error && notifications.length == "0" && (
-        <Alert severity="info">Something message</Alert>
-      )}
-
-      {loading && !error && notifications.length > 0 && (
-        <Stack spacing={1.5}>
-          {notifications.map((n) => (
-            <></>
-          ))}
-        </Stack>
-      )}
-
-      {!loading && (
-        <Box display="flex" justifyContent="center" mt={4}>
-          <Pagination
-            count={totalPages}
-            page={page}
-            onChange={handlePageChange}
-            color="primary"
-            shape="rounded"
-          />
-        </Box>
-      )}
-    </Box>
+    </Container>
   );
 }
