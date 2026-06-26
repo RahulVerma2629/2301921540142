@@ -140,3 +140,147 @@ Response: `{ "success": true, "message": "Notification deleted successfully." }`
 - **Connection:** Client opens a persistent WebSocket on app initialization.
 - **Push Delivery:** A DB commit hook serializes and pipes new events to open clients instantly — no polling.
 - **Reconnection:** On network drop, client retries the connection and syncs missed state via `GET /api/v1/notifications?isRead=false`.
+
+---
+---
+
+# Stage 2
+
+## Database Design Overview
+
+**Chosen Database: PostgreSQL**
+
+- Native UUID and ENUM support matches the Stage 1 schema constraints directly.
+- ACID compliance ensures `isRead` state transitions and soft-deletes are always consistent.
+- Partial indexes handle the read-heavy, filter-heavy query patterns of a notification feed efficiently.
+- Scales well with junction-table design for per-user state isolation across broadcast notifications.
+
+---
+
+## Database Schema
+
+```sql
+CREATE TYPE notification_type     AS ENUM ('Placement', 'Event', 'Exam', 'General');
+CREATE TYPE notification_priority AS ENUM ('Low', 'Medium', 'High');
+
+CREATE TABLE users (
+  id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  name       VARCHAR(100) NOT NULL,
+  email      VARCHAR(150) UNIQUE NOT NULL,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE notifications (
+  id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  title      VARCHAR(150) NOT NULL CHECK (char_length(title) >= 3),
+  message    TEXT NOT NULL,
+  type       notification_type NOT NULL,
+  priority   notification_priority NOT NULL DEFAULT 'Low',
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE user_notifications (
+  id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id         UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  notification_id UUID NOT NULL REFERENCES notifications(id) ON DELETE CASCADE,
+  is_read         BOOLEAN NOT NULL DEFAULT FALSE,
+  is_deleted      BOOLEAN NOT NULL DEFAULT FALSE,
+  read_at         TIMESTAMPTZ,
+  created_at      TIMESTAMPTZ DEFAULT NOW(),
+  UNIQUE (user_id, notification_id)
+);
+```
+
+---
+
+## Entity Relationship
+
+```
+users ──< user_notifications >── notifications
+           (is_read, is_deleted,
+            read_at, created_at)
+```
+
+`users` and `notifications` share a **many-to-many** relationship via `user_notifications`, which holds all per-user state independently.
+
+---
+
+## Indexing Strategy
+
+```sql
+-- Core feed query: unread, non-deleted rows per user
+CREATE INDEX idx_un_user_unread ON user_notifications (user_id, is_read, is_deleted)
+  WHERE is_read = FALSE AND is_deleted = FALSE;
+
+-- Filter by type (query param: type={enum})
+CREATE INDEX idx_notif_type ON notifications (type);
+
+-- Sort support for notification feed
+CREATE INDEX idx_notif_created ON notifications (created_at DESC);
+```
+
+---
+
+## Scalability Considerations
+
+| Problem | Solution |
+|---------|----------|
+| Table bloat at 50k students × N notifications | Partial indexes on `is_read = FALSE` — only actionable rows indexed |
+| Broadcast fan-out (50k inserts per event) | Async message queue (BullMQ) — background worker batch-inserts rows |
+| DB overwhelmed on every page load | Redis cache per user (TTL 60s) — invalidated on read/write events |
+
+---
+
+## Database Architecture Diagram
+
+```
+Client → Express API → Redis Cache (hit)
+                     ↓ (miss)
+               PostgreSQL
+         (users / notifications / user_notifications)
+                     ↓ (broadcast writes)
+              Message Queue (BullMQ)
+                     ↓
+           Background Worker → Batch DB Insert
+```
+
+---
+
+## REST Queries — Stage 1 APIs Mapped to SQL
+
+```sql
+-- GET /api/v1/notifications?isRead=false&type=Placement
+SELECT n.id, n.title, n.type, n.priority, un.is_read, n.created_at
+FROM   notifications n JOIN user_notifications un ON un.notification_id = n.id
+WHERE  un.user_id = $1 AND un.is_read = FALSE AND un.is_deleted = FALSE AND n.type = 'Placement'
+ORDER  BY n.created_at DESC;
+
+-- PATCH /api/v1/notifications/{id}/read
+UPDATE user_notifications SET is_read = TRUE, read_at = NOW()
+WHERE  notification_id = $1 AND user_id = $2;
+
+-- PATCH /api/v1/notifications/read-all
+UPDATE user_notifications SET is_read = TRUE, read_at = NOW()
+WHERE  user_id = $1 AND is_read = FALSE AND is_deleted = FALSE;
+
+-- DELETE /api/v1/notifications/{id}  (soft delete)
+UPDATE user_notifications SET is_deleted = TRUE
+WHERE  notification_id = $1 AND user_id = $2;
+```
+
+---
+
+## Design Decisions
+
+| Decision | Choice | Reason |
+|----------|--------|--------|
+| Database | PostgreSQL | ENUM, UUID, ACID, partial indexes |
+| Soft Delete | `is_deleted` flag | Preserves audit trail; no hard deletes |
+| State isolation | Junction table | Each user's read/delete state is independent |
+| Broadcast | Async queue | Decouples 50k inserts from API response time |
+| Caching | Redis (TTL 60s) | Absorbs read load; invalidated on state change |
+
+---
+---
+
