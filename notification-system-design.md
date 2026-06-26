@@ -284,3 +284,132 @@ WHERE  notification_id = $1 AND user_id = $2;
 ---
 ---
 
+# Stage 3
+
+## Slow Query Analysis
+
+The original query fetching unread notifications for a student:
+
+```sql
+SELECT * FROM notifications
+WHERE studentID = 1042 AND isRead = false
+ORDER BY createdAt ASC;
+```
+
+---
+
+## Is This Query Accurate?
+
+**Partially.** The query works only if `notifications` stores per-user state (`studentID`, `isRead`) directly in the same table. Based on the Stage 2 schema, per-user state lives in `user_notifications` (junction table), so this query would not exist in that form. However, for this stage we treat it as a flat single-table design and analyse it as given.
+
+---
+
+## Why Is It Slow?
+
+At 50,000 students and 5,000,000 notifications, a full table scan runs on every request. Without indexes on `studentID`, `isRead`, and `createdAt`, PostgreSQL reads every row before filtering — **O(n) per query**, which degrades linearly with data growth.
+
+---
+
+## What Would You Change?
+
+```sql
+-- Composite index covering all three filter/sort columns
+CREATE INDEX idx_notif_student_unread
+  ON notifications (studentID, isRead, createdAt ASC)
+  WHERE isRead = false;
+```
+
+This partial composite index ensures the DB only scans unread rows for a given student — reducing the query from a full table scan to an **index range scan**.
+
+**Optimised query:**
+```sql
+SELECT id, title, message, type, priority, createdAt
+FROM   notifications
+WHERE  studentID = $1 AND isRead = false
+ORDER  BY createdAt ASC;
+```
+
+Avoid `SELECT *` — fetching only required columns reduces I/O and network payload.
+
+---
+
+## Should Indexes Be Added on Every Column?
+
+**No — this advice is not effective.**
+
+Adding indexes on every column is harmful at scale:
+
+| Side Effect | Impact |
+|-------------|--------|
+| Write amplification | Every `INSERT`, `UPDATE`, `DELETE` must update all indexes |
+| Storage bloat | Each index is a separate B-Tree structure on disk |
+| Query planner confusion | Too many indexes cause suboptimal plan selection |
+
+**Correct approach:** Index only columns that appear in `WHERE`, `JOIN ON`, or `ORDER BY` clauses of frequent queries. Use partial indexes (`WHERE isRead = false`) to keep index size minimal.
+
+---
+
+## Query — Students With Placement Notification in Last 7 Days
+
+The `notifications` table has a `notificationType` column with enum values `"Event"`, `"Result"`, and `"Placement"`.
+
+```sql
+SELECT DISTINCT studentID
+FROM   notifications
+WHERE  notificationType = 'Placement'
+  AND  createdAt >= NOW() - INTERVAL '7 days';
+```
+
+**With supporting index:**
+```sql
+CREATE INDEX idx_notif_type_created
+  ON notifications (notificationType, createdAt DESC)
+  WHERE notificationType = 'Placement';
+```
+
+This index makes the 7-day placement filter an index-only scan — no heap access required for large datasets.
+
+---
+
+## Design Decisions
+
+| Decision | Reason |
+|----------|--------|
+| Partial composite index on `(studentID, isRead, createdAt)` | Covers the exact filter + sort pattern of the core fetch query |
+| Avoid `SELECT *` | Reduces I/O; prevents accidental exposure of internal fields |
+| Reject blanket column indexing | Write overhead outweighs read gains at 5M+ rows |
+| Partial index on `notificationType = 'Placement'` | Placement queries are a known frequent pattern; partial index stays lean |
+EOF
+wc -l /mnt/user-data/outputs/stage3-query-optimization.md
+---
+
+## Query Performance Summary
+
+```
+Before Optimization
+───────────────────
+Query Plan: Seq Scan on notifications
+Rows scanned: ~5,000,000
+Filter: studentID = 1042 AND isRead = false
+Cost: High — grows linearly with table size
+
+After Optimization
+──────────────────
+Query Plan: Index Scan using idx_notif_student_unread
+Rows scanned: Only unread rows for studentID = 1042
+Cost: Low — bounded by result set size, not table size
+```
+
+At 5,000,000 rows, the difference between a sequential scan and an index scan can be the difference between a 3–5 second response and a sub-10ms one. Partial indexes specifically exclude already-read notifications (the majority of rows over time), keeping the index compact and fast as the platform scales to more students and events.
+
+> **Note:** All indexes above should be created during a low-traffic maintenance window on a production system. For zero-downtime index creation on large tables, use `CREATE INDEX CONCURRENTLY` in PostgreSQL — it builds the index without locking the table for writes.
+
+```sql
+-- Zero-downtime index creation for production
+CREATE INDEX CONCURRENTLY idx_notif_student_unread
+  ON notifications (studentID, isRead, createdAt ASC)
+  WHERE isRead = false;
+```
+
+---
+---
