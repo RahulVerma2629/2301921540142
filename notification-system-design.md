@@ -413,3 +413,136 @@ CREATE INDEX CONCURRENTLY idx_notif_student_unread
 
 ---
 ---
+
+# Stage 4
+
+## Problem Statement
+
+Notifications are fetched from the database on every page load for every student. At 50,000 students with concurrent sessions, this creates a thundering herd of `SELECT` queries — the DB gets overwhelmed, response times spike, and the user experience degrades.
+
+---
+
+## Proposed Solution — Multi-Layer Caching Strategy
+
+Rather than hitting PostgreSQL on every request, introduce a caching layer between the API and the database. The solution uses **Redis** as the primary cache, combined with **pagination** and **HTTP response caching** to reduce load at every layer.
+
+---
+
+## Strategy 1 — Redis Cache (Primary)
+
+Cache the notification feed per user in Redis with a short TTL.
+
+```
+Request → Express API → Redis?
+                         ├── HIT  → return cached response (< 1ms)
+                         └── MISS → query PostgreSQL → store in Redis → return
+```
+
+**Implementation:**
+```js
+const cacheKey = `notifications:${userId}:unread`;
+
+const cached = await redis.get(cacheKey);
+if (cached) return JSON.parse(cached);
+
+const rows = await db.query(
+  `SELECT * FROM user_notifications
+   WHERE user_id = $1 AND is_read = FALSE AND is_deleted = FALSE
+   ORDER BY created_at DESC`, [userId]
+);
+
+await redis.setex(cacheKey, 60, JSON.stringify(rows)); // TTL: 60s
+return rows;
+```
+
+**Cache Invalidation:** On `PATCH /read`, `PATCH /read-all`, or new notification delivery — delete the user's cache key so the next request pulls fresh data.
+
+```js
+await redis.del(`notifications:${userId}:unread`);
+```
+
+**Tradeoff:** Up to 60s of stale data between a notification arriving and the user seeing it — acceptable for non-critical updates; reduce TTL for high-priority types.
+
+---
+
+## Strategy 2 — Pagination (DB Load Reduction)
+
+Fetching all notifications for a user in one query is wasteful. Paginate at the API layer:
+
+```sql
+SELECT * FROM user_notifications
+WHERE  user_id = $1 AND is_deleted = FALSE
+ORDER  BY created_at DESC
+LIMIT  $2 OFFSET $3;
+```
+
+- Default page size: **20 rows**
+- Client requests `?page=1&limit=20`
+- Reduces per-query row transfer from potentially thousands to a fixed ceiling
+
+**Tradeoff:** Client must implement pagination UI. Deep pages (`OFFSET 10000`) are still slow — use **cursor-based pagination** (`WHERE created_at < $lastSeen`) for very large feeds.
+
+---
+
+## Strategy 3 — Unread Count Cache (Separate Key)
+
+The notification bell counter (unread count) is fetched on every page load but doesn't need the full payload.
+
+```js
+const countKey = `notifications:${userId}:count`;
+const count = await redis.get(countKey);
+if (count) return { unreadCount: parseInt(count) };
+
+const result = await db.query(
+  `SELECT COUNT(*) FROM user_notifications
+   WHERE user_id = $1 AND is_read = FALSE AND is_deleted = FALSE`, [userId]
+);
+await redis.setex(countKey, 120, result.rows[0].count);
+```
+
+Separating count from payload means the bell icon never triggers a heavy query.
+
+---
+
+## Strategy Tradeoffs Summary
+
+| Strategy | Benefit | Tradeoff |
+|----------|---------|----------|
+| Redis cache (TTL 60s) | Eliminates DB hits on repeat loads | Up to 60s stale data window |
+| Pagination (limit 20) | Caps per-query cost regardless of dataset size | Requires client-side pagination logic |
+| Cursor-based pagination | Constant-time deep paging | More complex query and client state |
+| Unread count cache | Decouples bell counter from feed query | Count can lag by up to 120s |
+| Cache invalidation on write | Keeps data fresh after user actions | Adds a Redis `DEL` call on every state-change |
+
+---
+
+## Database Architecture With Caching
+
+```
+Student Browser
+      │
+      ▼
+Express API
+      │
+      ├──► Redis (TTL cache)
+      │         └── HIT: return immediately
+      │
+      └──► PostgreSQL (on cache miss)
+                │
+                └── Partial index scan
+                    (idx_un_user_unread)
+```
+
+---
+
+## Design Decisions
+
+| Decision | Reason |
+|----------|--------|
+| Redis over in-memory cache | Shared across API instances; survives restarts |
+| TTL 60s for feed, 120s for count | Balances freshness vs. DB load |
+| Invalidate on write, not on schedule | Ensures reads after a user action are always correct |
+| Pagination default 20 rows | Matches typical mobile viewport; reduces initial payload |
+| Keep DB indexes from Stage 3 | Cache misses still need fast DB queries |
+EOF
+wc -l /mnt/user-data/outputs/stage4-caching-performance.md
